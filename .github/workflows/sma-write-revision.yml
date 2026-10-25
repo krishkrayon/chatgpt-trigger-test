@@ -469,23 +469,29 @@ jobs:
           PYEOF
 
       # ── 9. Verify only the expected file was written ──────────────────────
+      # Uses exact string comparison — no grep -v pipeline (grep exits 1
+      # when it produces no output, which is the SUCCESS case, causing bash
+      # set -e to kill the script as a false failure).
       - name: Verify changed-file set
         if: |
           steps.idempotency.outputs.revision_needed == 'true' &&
           steps.validate_file.outputs.file_valid == 'true'
         run: |
           EXPECTED="plans/test-dummy-001/plan_r3.md"
-          CHANGED=$(git status --porcelain)
-          UNEXPECTED=$(echo "$CHANGED" | grep -v "^?? ${EXPECTED}$" | grep -v "^$")
-          if [ -n "$UNEXPECTED" ]; then
-            echo "FAIL: unexpected filesystem changes:"
-            echo "$UNEXPECTED"
+          CHANGED=$(git status --porcelain --untracked-files=all)
+          echo "git status --porcelain output:"
+          echo "${CHANGED:-(empty)}"
+          EXPECTED_LINE="?? $EXPECTED"
+          if [ "$CHANGED" != "$EXPECTED_LINE" ]; then
+            echo "FAIL: expected exactly one untracked new file"
+            echo "  expected: '$EXPECTED_LINE'"
+            echo "  actual:   '$CHANGED'"
             exit 1
           fi
           if [ -L "$EXPECTED" ]; then
             echo "FAIL: $EXPECTED is a symlink"; exit 1
           fi
-          echo "CLEAN: only $EXPECTED was written"
+          echo "CLEAN: exactly '$EXPECTED_LINE' and nothing else"
 
       # ── 10. Upload revision artifact (readiness gate) ─────────────────────
       # Artifact name binds to: PR, source SHA, round, completion comment ID.
