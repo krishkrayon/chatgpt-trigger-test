@@ -208,8 +208,5 @@ jobs:
               print("=== PROPOSED REVISION (Claude response) ===")
               print(last_text)
           else:
-              print("No assistant text found — execution_file format may differ.")
-              print("First 3 raw lines for diagnosis:")
-              for l in raw_lines[:3]:
-                  print(" ", l[:200])
+              print("No assistant text response found in execution file.")
           PYEOF
