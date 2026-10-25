@@ -1,12 +1,19 @@
 """
-Phase A — SMA Review Loop: comment validation (read-only, no Claude invocation).
+Phase A + B — SMA Review Loop: comment validation.
 
-Reads the GitHub event JSON from GITHUB_EVENT_PATH, validates the
-SMA_REVIEW_COMPLETED protocol fields, and logs ACCEPT or REJECT with a reason.
+Reads the GitHub event JSON from GITHUB_EVENT_PATH, validates
+SMA_REVIEW_COMPLETED protocol fields, and:
+  - Logs ACCEPT or REJECT with reason (stdout)
+  - Writes validated metadata to GITHUB_OUTPUT (no free-form text)
+  - On ACCEPT+CHANGES_REQUESTED: writes bounded context JSON to
+    $RUNNER_TEMP/sma-context.json for inter-job artifact transfer
+
 No shell interpolation of comment data; no execution of content from comments.
+Findings and Recommendations are treated as untrusted free-form text,
+bounded to 500 chars each, and only stored in the JSON artifact — never in
+GITHUB_OUTPUT or shell variables.
 
-Exit codes: 0 always (workflow never fails from a bad comment; rejection is
-logged and the job exits cleanly).
+Exit codes: 0 always (rejection is logged cleanly; never fails the job).
 """
 
 import json
@@ -22,36 +29,86 @@ SELF_TRIGGER_LOGIN = "krish7-dev"
 ALLOWED_STATUSES = {"ACCEPTED", "CHANGES_REQUESTED", "UNRESOLVABLE"}
 PLAN_ID_RE = re.compile(r'^[A-Za-z0-9][A-Za-z0-9\-_]{2,63}$')
 SHA_RE = re.compile(r'^[0-9a-f]{40}$', re.IGNORECASE)
+MAX_FEEDBACK_CHARS = 500
+
+
+def _safe_str(v, max_len=80):
+    return str(v)[:max_len].replace('\n', ' ').replace('\r', ' ')
+
+
+def write_github_output(**fields):
+    """Write validated metadata fields to GITHUB_OUTPUT. No free-form text."""
+    path = os.environ.get("GITHUB_OUTPUT", "")
+    if not path:
+        return
+    with open(path, "a", encoding="utf-8") as f:
+        for k, v in fields.items():
+            f.write(f"{k}={v}\n")
+
+
+def write_context_artifact(plan_id, round_n, head_sha, status, findings, recommendations):
+    """
+    Write bounded review context JSON to $RUNNER_TEMP/sma-context.json.
+    Findings and recommendations are stored here only — not in GITHUB_OUTPUT.
+    Bounded to MAX_FEEDBACK_CHARS each to limit injection surface.
+    """
+    dest_dir = os.environ.get("RUNNER_TEMP", "/tmp")
+    dest = os.path.join(dest_dir, "sma-context.json")
+    context = {
+        "plan_id": plan_id,
+        "round": round_n,
+        "head_sha": head_sha,
+        "status": status,
+        "findings": (findings or "none")[:MAX_FEEDBACK_CHARS],
+        "recommendations": (recommendations or "none")[:MAX_FEEDBACK_CHARS],
+    }
+    with open(dest, "w", encoding="utf-8") as f:
+        json.dump(context, f, ensure_ascii=True, indent=2)
+    print(f"Context artifact written: {dest}", flush=True)
+    return dest
 
 
 def log_reject(reason, **ctx):
     print(f"RESULT=REJECT reason={reason!r}", flush=True)
     for k, v in ctx.items():
-        # Sanitize: only log scalar safe values (numbers, short strings)
-        safe = str(v)[:80].replace('\n', ' ').replace('\r', ' ')
-        print(f"  {k}={safe}", flush=True)
+        print(f"  {k}={_safe_str(v)}", flush=True)
+    write_github_output(accepted="false")
     sys.exit(0)
 
 
-def log_accept(**ctx):
+def log_accept(plan_id, round_n, actual_sha, status, commenter):
     print("RESULT=ACCEPT", flush=True)
-    for k, v in ctx.items():
-        safe = str(v)[:80].replace('\n', ' ').replace('\r', ' ')
-        print(f"  {k}={safe}", flush=True)
-    sys.exit(0)
+    for k, v in [("plan_id", plan_id), ("round", round_n), ("sha", actual_sha[:12]),
+                 ("status", status), ("commenter", commenter),
+                 ("reviewer_identity", "UNVERIFIED")]:
+        print(f"  {k}={_safe_str(v)}", flush=True)
 
 
 def parse_protocol_field(body, field_name, value_pattern=r'\S+'):
     """
-    Extract a value from a line like "Field-Name: value".
-    Returns None if not found or ambiguous (multiple matches).
-    Never evaluates or executes the value.
+    Extract a value from a line exactly matching "Field-Name: value".
+    Returns None if absent or if the field appears more than once.
+    Never evaluates the value.
     """
     pattern = rf'^{re.escape(field_name)}:\s*({value_pattern})\s*$'
     matches = re.findall(pattern, body, re.MULTILINE)
     if len(matches) == 1:
         return matches[0].strip()
-    return None  # absent or duplicate — both are rejection cases
+    return None
+
+
+def parse_feedback_field(body, field_name):
+    """
+    Extract a single-line free-form field value.
+    Returns None if absent or duplicated; "none" if value is blank.
+    Bounded to MAX_FEEDBACK_CHARS before storage.
+    """
+    # Match any non-empty content on the same line as the field name.
+    pattern = rf'^{re.escape(field_name)}:\s*([^\r\n]+)'
+    matches = re.findall(pattern, body, re.MULTILINE)
+    if len(matches) == 1:
+        return matches[0].strip()[:MAX_FEEDBACK_CHARS] or "none"
+    return "none"
 
 
 def main():
@@ -95,7 +152,7 @@ def main():
     if "SMA_REVIEW_COMPLETED" not in lines:
         log_reject("SMA_REVIEW_COMPLETED marker absent or not on its own line", pr=pr_number)
 
-    # 7. Parse all required fields
+    # 7. Parse all required structured fields
     plan_id  = parse_protocol_field(body, "Plan-ID")
     round_s  = parse_protocol_field(body, "Round", r'\d+')
     pr_field = parse_protocol_field(body, "PR", r'\d+')
@@ -134,7 +191,7 @@ def main():
     if status not in ALLOWED_STATUSES:
         log_reject("Status not in allowed set", status=status, pr=pr_number)
 
-    # 13. Fetch current PR head SHA via read-only API call
+    # 13. Fetch current PR head SHA via read-only API call (not from comment text)
     token = os.environ.get("GITHUB_TOKEN", "")
     if not token:
         log_reject("GITHUB_TOKEN not available", pr=pr_number)
@@ -145,7 +202,7 @@ def main():
         headers={
             "Authorization": f"Bearer {token}",
             "Accept": "application/vnd.github+json",
-            "User-Agent": "sma-review-loop-phase-a/1.0",
+            "User-Agent": "sma-review-loop-phase-ab/1.0",
         },
     )
     try:
@@ -168,16 +225,21 @@ def main():
             pr=pr_number,
         )
 
-    # All guards passed — log sanitized ACCEPT (reviewer identity not verified)
-    log_accept(
-        pr=pr_number,
+    # All guards passed — write structured outputs (no free-form text in outputs)
+    write_github_output(
+        accepted="true",
         plan_id=plan_id,
-        round=round_n,
+        round=str(round_n),
+        head_sha=actual_sha,
         status=status,
-        sha=actual_sha[:12],
-        commenter=commenter,
-        reviewer_identity="UNVERIFIED",
     )
+    log_accept(plan_id, round_n, actual_sha, status, commenter)
+
+    # Write context artifact only when Phase B will run (CHANGES_REQUESTED, round < 3)
+    if status == "CHANGES_REQUESTED" and round_n < 3:
+        findings = parse_feedback_field(body, "Findings")
+        recommendations = parse_feedback_field(body, "Recommendations")
+        write_context_artifact(plan_id, round_n, actual_sha, status, findings, recommendations)
 
 
 if __name__ == "__main__":
