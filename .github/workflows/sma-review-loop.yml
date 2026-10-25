@@ -1,0 +1,40 @@
+# SMA Review Loop — Phase A (detection only)
+#
+# Triggers on PR conversation comments. Validates SMA_REVIEW_COMPLETED
+# protocol fields using a Python script. Logs ACCEPT or REJECT with reason.
+#
+# Phase A constraints:
+#   - No Claude invocation, no Anthropic credentials
+#   - No commits, no file modifications, no PR comments posted
+#   - Read-only GitHub API access only
+#   - All comment content parsed as data; nothing executed from it
+
+name: SMA Review Loop (Phase A)
+
+on:
+  issue_comment:
+    types: [created]
+
+permissions:
+  contents: read
+  pull-requests: read
+  issues: read
+
+jobs:
+  detect-review-completion:
+    name: Detect SMA_REVIEW_COMPLETED
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout main (scripts only)
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          sparse-checkout: |
+            .github/scripts
+          sparse-checkout-cone-mode: false
+
+      - name: Validate SMA_REVIEW_COMPLETED comment
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: python3 .github/scripts/validate_review_comment.py
