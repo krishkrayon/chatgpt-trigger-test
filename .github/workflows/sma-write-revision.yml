@@ -577,8 +577,7 @@ jobs:
             echo "FAIL: staged ($STAGED) != expected ($FILE)"; exit 1
           fi
 
-          git commit -m "review(test-dummy-001): round-3 revised plan [automated]
-idempotency-key:pr=${PR},round=2,comment=${COMMENT_ID}"
+          git commit -m "review(test-dummy-001): round-3 revised plan [automated] idempotency-key:pr=${PR},round=2,comment=${COMMENT_ID}"
 
           NEW_SHA=$(git rev-parse HEAD)
           echo "new_sha=${NEW_SHA}" >> "$GITHUB_OUTPUT"
