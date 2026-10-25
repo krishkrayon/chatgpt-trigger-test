@@ -217,6 +217,13 @@ def main():
     if not actual_sha:
         log_reject("could not retrieve PR head SHA from API", pr=pr_number)
 
+    # Fork guard — reject PRs from forks not owned by krishkrayon
+    fork_owner = pr_data.get("head", {}).get("repo", {}).get("owner", {}).get("login", "")
+    if fork_owner != "krishkrayon":
+        log_reject("fork PR rejected", fork_owner=fork_owner[:40], pr=pr_number)
+
+    head_ref = pr_data.get("head", {}).get("ref", "")
+
     if head_sha.lower() != actual_sha.lower():
         log_reject(
             "Head-SHA mismatch",
@@ -231,6 +238,7 @@ def main():
         plan_id=plan_id,
         round=str(round_n),
         head_sha=actual_sha,
+        head_ref=head_ref,
         status=status,
     )
     log_accept(plan_id, round_n, actual_sha, status, commenter)
