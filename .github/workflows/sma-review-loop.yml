@@ -213,3 +213,106 @@ jobs:
           else:
               print("No assistant text response found in execution file.")
           PYEOF
+
+  # ── Phase C ──────────────────────────────────────────────────────────────────
+  # Dispatches sma-write-revision.yml automatically after a validated
+  # CHANGES_REQUESTED completion. Requires sma-auto-review label on the PR.
+  auto-dispatch-revision:
+    name: Auto-dispatch revision (Phase C — CHANGES_REQUESTED only)
+    needs: detect-review-completion
+    if: |
+      needs.detect-review-completion.outputs.accepted == 'true' &&
+      needs.detect-review-completion.outputs.status == 'CHANGES_REQUESTED' &&
+      needs.detect-review-completion.outputs.round != '3'
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+      actions: write
+
+    steps:
+      # ── 1. Enrollment gate (label-based — fail closed) ─────────────────────
+      # sma-auto-review must be present on the PR. Any API error fails the step
+      # (does not silently skip). Enrolled=false skips dispatch only.
+      - name: Check enrollment label
+        id: enrollment
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.issue.number }}
+        run: |
+          python3 - << 'PYEOF'
+          import urllib.request, json, os, sys
+
+          token = os.environ["GITHUB_TOKEN"]
+          pr    = os.environ["PR_NUMBER"]
+          REPO  = "krishkrayon/chatgpt-trigger-test"
+
+          try:
+              req = urllib.request.Request(
+                  f"https://api.github.com/repos/{REPO}/issues/{pr}/labels",
+                  headers={"Authorization": f"Bearer {token}",
+                           "Accept": "application/vnd.github+json",
+                           "User-Agent": "sma-review-loop/1.0"},
+              )
+              with urllib.request.urlopen(req, timeout=20) as r:
+                  labels = [l["name"] for l in json.loads(r.read())]
+          except Exception as e:
+              print(f"ERROR: label fetch failed: {e}")
+              sys.exit(1)  # fail closed — do not dispatch on uncertainty
+
+          enrolled = "sma-auto-review" in labels
+          out = os.environ.get("GITHUB_OUTPUT", "")
+          if out:
+              with open(out, "a") as f:
+                  f.write(f"enrolled={'true' if enrolled else 'false'}\n")
+          if enrolled:
+              print(f"ENROLLED: PR #{pr}")
+          else:
+              print(f"SKIP: PR #{pr} — label 'sma-auto-review' not found")
+          PYEOF
+
+      # ── 2. Dispatch sma-write-revision.yml ───────────────────────────────
+      # Runs only when enrolled == true. Uses GITHUB_TOKEN with actions: write.
+      # github.actor for the dispatched run will be github-actions[bot].
+      - name: Dispatch sma-write-revision.yml
+        if: steps.enrollment.outputs.enrolled == 'true'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.issue.number }}
+          COMMENT_ID: ${{ github.event.comment.id }}
+        run: |
+          python3 - << 'PYEOF'
+          import urllib.request, json, os, sys
+
+          token      = os.environ["GITHUB_TOKEN"]
+          pr_number  = os.environ["PR_NUMBER"]
+          comment_id = os.environ["COMMENT_ID"]
+          REPO       = "krishkrayon/chatgpt-trigger-test"
+
+          payload = json.dumps({
+              "ref": "main",
+              "inputs": {"pr_number": pr_number,
+                         "completion_comment_id": comment_id},
+          }).encode()
+          req = urllib.request.Request(
+              f"https://api.github.com/repos/{REPO}/actions/workflows/sma-write-revision.yml/dispatches",
+              data=payload,
+              headers={"Authorization": f"Bearer {token}",
+                       "Accept": "application/vnd.github+json",
+                       "Content-Type": "application/json",
+                       "User-Agent": "sma-review-loop/1.0"},
+              method="POST",
+          )
+          try:
+              with urllib.request.urlopen(req, timeout=20) as r:
+                  status = r.status
+          except urllib.error.HTTPError as e:
+              status = e.code
+              print(f"ERROR: dispatch failed HTTP {status}: {e.read().decode()}")
+              sys.exit(1)
+          if status == 204:
+              print(f"AUTO-DISPATCH OK: PR #{pr_number}, comment #{comment_id}")
+          else:
+              print(f"UNEXPECTED dispatch status {status}")
+              sys.exit(1)
+          PYEOF

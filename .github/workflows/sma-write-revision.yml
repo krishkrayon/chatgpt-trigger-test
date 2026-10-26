@@ -1,10 +1,16 @@
-# SMA Write Revision — Phase C3A
+# SMA Write Revision — Phase C3B
 #
-# Triggered ONLY by human workflow_dispatch (krishkrayon). Two jobs:
+# Triggered by workflow_dispatch: krishkrayon (human) OR github-actions[bot] (Phase C auto).
+# Two jobs:
 #
 #   Job A (generate-revision) — GitHub permissions: contents: read only.
-#     - Verifies dispatch actor (krishkrayon only — human gate retained).
-#     - Re-fetches and re-validates the SMA_REVIEW_COMPLETED comment by ID.
+#     - Verifies dispatch actor (krishkrayon or github-actions[bot]).
+#     - Verifies enrollment label (sma-auto-review) — blocks unenrolled PRs even on direct dispatch.
+#     - Re-fetches and re-validates the SMA_REVIEW_COMPLETED comment by ID (13 guards).
+#     - Prior-request sub-check (round-aware):
+#         Round 1: validates SMA_REVIEW_REQUEST in PR body (exact fields).
+#         Round 2: validates matching SMA_REVIEW_REQUEST comment posted before completion.
+#     - Verifies current plan_r<N>.md exists at verified SHA.
 #     - Rejects Round 3+ revisions (three-round maximum).
 #     - Extracts bounded review context from the comment body (no cross-run artifact).
 #     - Runs Claude (Read + Write to plans/<plan_id>/ only).
@@ -15,14 +21,13 @@
 #   Job B (commit-and-push) — GitHub permissions: contents: write, pull-requests: write.
 #     - Runs ONLY when Job A exports revision_ready=true.
 #     - Downloads the exact artifact from Job A.
-#     - Re-verifies PR head has not changed since Job A ran.
+#     - Re-verifies enrollment label, PR head SHA, and target path BEFORE posting request.
 #     - Commits only the designated Markdown file.
 #     - Posts SMA_REVIEW_REQUEST BEFORE pushing.
 #     - Pushes with an explicit refspec; verifies remote head matches (bounded retry).
 #
 # Supports any Plan-ID and any round 1 or 2 (Round 1 → 2, Round 2 → 3).
-# Human dispatch (krishkrayon) remains the sole write-activation gate.
-# Full autonomous write activation requires separately verifiable reviewer identity (C3B).
+# Enrollment: sma-auto-review label required (trusted repo-owner action, not PR-body marker).
 
 name: SMA Write Revision
 
@@ -63,11 +68,44 @@ jobs:
       # ── 1. Verify dispatch actor ──────────────────────────────────────────
       - name: Verify dispatch actor
         run: |
-          if [ "${{ github.actor }}" != "krishkrayon" ]; then
-            echo "REJECT: dispatch by '${{ github.actor }}' — only krishkrayon is authorized"
+          actor="${{ github.actor }}"
+          if [ "$actor" != "krishkrayon" ] && [ "$actor" != "github-actions[bot]" ]; then
+            echo "REJECT: dispatch by '$actor' — only krishkrayon or github-actions[bot] authorized"
             exit 1
           fi
-          echo "Actor verified: ${{ github.actor }}"
+          echo "Actor verified: $actor"
+
+      # ── 1.5. Verify enrollment label (independent of Phase C gate) ───────
+      # sma-auto-review must be present — applied by repo owner, not by PR author.
+      # Blocks direct manual/API dispatch on unenrolled PRs.
+      - name: Verify enrollment label
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER:    ${{ inputs.pr_number }}
+        run: |
+          python3 - << 'PYEOF'
+          import urllib.request, json, os, sys
+
+          token = os.environ["GITHUB_TOKEN"]
+          pr    = os.environ["PR_NUMBER"]
+          REPO  = "krishkrayon/chatgpt-trigger-test"
+          try:
+              req = urllib.request.Request(
+                  f"https://api.github.com/repos/{REPO}/issues/{pr}/labels",
+                  headers={"Authorization": f"Bearer {token}",
+                           "Accept": "application/vnd.github+json",
+                           "User-Agent": "sma-write-revision/1.0"},
+              )
+              with urllib.request.urlopen(req, timeout=20) as r:
+                  labels = [l["name"] for l in json.loads(r.read())]
+          except Exception as e:
+              print(f"ERROR: label fetch failed: {e}")
+              sys.exit(1)
+          if "sma-auto-review" not in labels:
+              print(f"REJECT: PR #{pr} not enrolled — label 'sma-auto-review' absent")
+              sys.exit(1)
+          print(f"ENROLLMENT OK: PR #{pr}")
+          PYEOF
 
       # ── 2. Re-fetch and re-validate the completion comment ───────────────
       # Authorization is bound to: repository, PR number, Plan-ID, Round,
@@ -175,6 +213,109 @@ jobs:
               fail("fork PR rejected", fork_owner=fork_own[:40])
           if head_sha.lower() != actual.lower():
               fail("Head-SHA mismatch", comment_sha=head_sha[:12], actual_sha=actual[:12])
+
+          # ── Sub-check A: prior SMA_REVIEW_REQUEST validation ──────────────
+          def parse_request_block(text):
+              """Parse SMA_REVIEW_REQUEST block. Returns (fields_dict, error_str)."""
+              stripped_lines = [l.strip() for l in text.splitlines()]
+              count = stripped_lines.count("SMA_REVIEW_REQUEST")
+              if count == 0:
+                  return None, "SMA_REVIEW_REQUEST sentinel not found"
+              if count > 1:
+                  return None, "Duplicate SMA_REVIEW_REQUEST sentinel"
+              idx = stripped_lines.index("SMA_REVIEW_REQUEST")
+              fields = {}
+              for line in stripped_lines[idx + 1:]:
+                  if not line:
+                      break  # block ends at blank line
+                  if ": " not in line:
+                      return None, f"Malformed field line: {line!r}"
+                  key, _, val = line.partition(": ")
+                  key = key.strip(); val = val.strip().strip("`")
+                  if key in fields:
+                      return None, f"Duplicate field: {key!r}"
+                  fields[key] = val
+              return fields, None
+
+          REQUIRED_REQ = {"Plan-ID", "Round", "Head-SHA", "Review file"}
+          OPTIONAL_REQ = {"PR"}
+          ALL_REQ      = REQUIRED_REQ | OPTIONAL_REQ
+
+          def validate_req_fields(fields, exp_plan_id, exp_round, exp_sha, pr_num):
+              """Returns error string or None."""
+              missing = REQUIRED_REQ - fields.keys()
+              if missing:
+                  return f"Missing required fields: {sorted(missing)}"
+              extra = fields.keys() - ALL_REQ
+              if extra:
+                  return f"Unexpected fields: {sorted(extra)}"
+              if fields["Plan-ID"] != exp_plan_id:
+                  return f"Plan-ID mismatch: {fields['Plan-ID']!r} != {exp_plan_id!r}"
+              if not fields["Round"].isdigit() or int(fields["Round"]) != exp_round:
+                  return f"Round mismatch: {fields['Round']!r} != {exp_round}"
+              if not SHA_RE.match(fields["Head-SHA"]):
+                  return f"Head-SHA format invalid"
+              if fields["Head-SHA"].lower() != exp_sha.lower():
+                  return f"Head-SHA mismatch in request"
+              expected_rf = f"plans/{exp_plan_id}/plan_r{exp_round}.md"
+              if fields["Review file"] != expected_rf:
+                  return f"Review file mismatch: {fields['Review file']!r} != {expected_rf!r}"
+              if "PR" in fields and fields["PR"] != str(pr_num):
+                  return f"PR field mismatch: {fields['PR']!r} != {pr_num!r}"
+              return None
+
+          if round_n == 1:
+              pr_body = pr_data.get("body") or ""
+              req_fields, err = parse_request_block(pr_body)
+              if err:
+                  fail(f"SMA_REVIEW_REQUEST in PR body: {err}")
+              err = validate_req_fields(req_fields, plan_id, 1, actual, pr)
+              if err:
+                  fail(f"SMA_REVIEW_REQUEST in PR body invalid: {err}")
+              print("PRIOR_REQUEST_OK: Round 1 — verified in PR body")
+          elif round_n == 2:
+              comp_created_at = c["created_at"]
+              try:
+                  cmt_list = api(
+                      f"https://api.github.com/repos/{REPO}/issues/{pr}/comments"
+                      f"?per_page=100&sort=created&direction=asc"
+                  )
+              except urllib.error.HTTPError as e:
+                  fail("comments fetch failed", http_status=e.code)
+              AUTHORIZED = {"krishkrayon", "github-actions[bot]"}
+              prior = None
+              for cmt in cmt_list:
+                  if cmt["id"] == int(comment_id):
+                      break  # only look at comments before the completion comment
+                  if cmt["user"]["login"] not in AUTHORIZED:
+                      continue
+                  body_c = cmt.get("body") or ""
+                  if "SMA_REVIEW_REQUEST" not in body_c:
+                      continue
+                  req_fields, err = parse_request_block(body_c)
+                  if err:
+                      continue
+                  err = validate_req_fields(req_fields, plan_id, 2, actual, pr)
+                  if err:
+                      continue
+                  if cmt["created_at"] >= comp_created_at:
+                      fail(f"Request ordering violation: request at {cmt['created_at']} "
+                           f"not before completion at {comp_created_at}")
+                  prior = cmt
+              if prior is None:
+                  fail(f"No valid SMA_REVIEW_REQUEST (Round 2, plan_id={plan_id!r}, "
+                       f"sha={actual[:12]}) found before completion #{comment_id}")
+              print(f"PRIOR_REQUEST_OK: Round 2 — comment #{prior['id']} at {prior['created_at']}")
+
+          # ── Sub-check B: current plan file exists at verified SHA ──────────
+          plan_file_path = f"plans/{plan_id}/plan_r{round_n}.md"
+          try:
+              api(f"https://api.github.com/repos/{REPO}/contents/{plan_file_path}?ref={actual}")
+              print(f"PLAN_FILE_OK: {plan_file_path} at {actual[:8]}")
+          except urllib.error.HTTPError as e:
+              if e.code == 404:
+                  fail(f"plan file {plan_file_path!r} not found at SHA {actual[:12]}")
+              fail(f"plan file check API error", http_status=e.code)
 
           # Extract bounded review content from comment body.
           # Strip protocol header lines; take remainder up to MAX_REVIEW_CHARS.
@@ -568,7 +709,9 @@ jobs:
           fetch-depth: 30
 
       # ── 3. Verify PR state and idempotency (compare-and-swap) ────────────
-      # Re-checks: remote head unchanged, plan_r{N+1}.md absent, comment not committed.
+      # Re-checks: enrollment label present, remote head unchanged,
+      # plan_r{N+1}.md absent, comment not committed, target path exact.
+      # Must complete before SMA_REVIEW_REQUEST is posted or any write occurs.
       # Fails with exit 1 if any condition changed since Job A ran.
       - name: Verify PR state before write
         env:
@@ -596,33 +739,51 @@ jobs:
               req = urllib.request.Request(url, headers={
                   "Authorization": f"Bearer {token}",
                   "Accept": "application/vnd.github+json",
+                  "User-Agent": "sma-write-revision/1.0",
               })
               with urllib.request.urlopen(req, timeout=15) as r:
                   return json.load(r)
 
-          # Check remote head has not changed
+          def abort(msg):
+              print(f"ABORT: {msg}"); sys.exit(1)
+
+          # ── Re-check enrollment label ──────────────────────────────────────
+          try:
+              labels = [l["name"] for l in
+                        api(f"https://api.github.com/repos/{REPO}/issues/{pr}/labels")]
+          except Exception as e:
+              abort(f"label re-fetch failed: {e}")
+          if "sma-auto-review" not in labels:
+              abort(f"label 'sma-auto-review' was removed from PR #{pr} — aborting write")
+
+          # ── Re-check remote head has not changed ─────────────────────────
           pr_data = api(f"https://api.github.com/repos/{REPO}/pulls/{pr}")
           remote  = pr_data["head"]["sha"]
           if remote != expected:
-              print(f"ABORT: remote head changed {remote[:12]} != {expected[:12]}")
-              sys.exit(1)
+              abort(f"remote head changed {remote[:12]} != {expected[:12]}")
 
-          # Check plan_r{N+1}.md still absent on remote
+          # ── Verify target path is exactly plans/<plan_id>/plan_r<N+1>.md ─
           next_r = round_n + 1
+          expected_path = f"plans/{plan_id}/plan_r{next_r}.md"
+          # (Assertion: the file name is deterministic; no free-form path.)
+          print(f"Target path: {expected_path}")
+
+          # ── Check plan_r{N+1}.md still absent on remote (idempotency) ────
           try:
-              api(f"https://api.github.com/repos/{REPO}/contents/plans/{plan_id}/plan_r{next_r}.md?ref={branch}")
-              print(f"ABORT: plan_r{next_r}.md already exists on remote — already processed"); sys.exit(1)
+              api(f"https://api.github.com/repos/{REPO}/contents/{expected_path}?ref={branch}")
+              abort(f"plan_r{next_r}.md already exists on remote — already processed")
           except urllib.error.HTTPError as e:
               if e.code != 404:
-                  print(f"ABORT: API error checking file: {e.code}"); sys.exit(1)
+                  abort(f"API error checking file: {e.code}")
 
-          # Check comment ID not in remote commit log
+          # ── Check comment ID not in remote commit log ─────────────────────
           commits = api(f"https://api.github.com/repos/{REPO}/commits?sha={branch}&per_page=30")
           for c in commits:
               if comment in c["commit"]["message"]:
-                  print(f"ABORT: comment {comment} already in commit log"); sys.exit(1)
+                  abort(f"comment {comment} already in commit log")
 
-          print(f"Pre-write state verified: remote={remote[:12]} plan_r{next_r}.md absent")
+          print(f"Pre-write state verified: enrolled, remote={remote[:12]}, "
+                f"{expected_path} absent, comment not in log")
           PYEOF
 
       # ── 4. Copy artifact to working tree ──────────────────────────────────
