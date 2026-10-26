@@ -11,7 +11,7 @@
 #         Round 1: validates SMA_REVIEW_REQUEST in PR body (exact fields).
 #         Round 2: validates matching SMA_REVIEW_REQUEST comment posted before completion.
 #     - Verifies current plan_r<N>.md exists at verified SHA.
-#     - Rejects Round 3+ revisions (three-round maximum).
+#     - Rejects Round 30+ revisions (30-round ceiling).
 #     - Extracts bounded review context from the comment body (no cross-run artifact).
 #     - Runs Claude (Read + Write to plans/<plan_id>/ only).
 #     - Validates the exact changed-file set; rejects symlinks.
@@ -26,7 +26,7 @@
 #     - Posts SMA_REVIEW_REQUEST BEFORE pushing.
 #     - Pushes with an explicit refspec; verifies remote head matches (bounded retry).
 #
-# Supports any Plan-ID and any round 1 or 2 (Round 1 → 2, Round 2 → 3).
+# Supports any Plan-ID and any round 1–29 (ceiling: 30 rounds total).
 # Enrollment: sma-auto-review label required (trusted repo-owner action, not PR-body marker).
 
 name: SMA Write Revision
@@ -191,8 +191,8 @@ jobs:
               round_n = int(round_s)
           except ValueError:
               fail("Round is not an integer", round_raw=round_s)
-          if round_n >= 3:
-              fail("round 3+ cannot be revised — three-round maximum", round=round_n)
+          if round_n >= 30:
+              fail("round 30+ cannot be revised — 30-round ceiling", round=round_n)
           if int(pr_field) != int(pr):
               fail("PR field mismatch", pr_field=pr_field, expected=pr)
           if not SHA_RE.match(head_sha):

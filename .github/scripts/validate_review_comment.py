@@ -176,8 +176,8 @@ def main():
         round_n = int(round_s)
     except ValueError:
         log_reject("Round is not an integer", round_raw=round_s, pr=pr_number)
-    if not (1 <= round_n <= 3):
-        log_reject("Round out of range 1-3", round=round_n, pr=pr_number)
+    if not (1 <= round_n <= 30):
+        log_reject("Round out of range 1-30", round=round_n, pr=pr_number)
 
     # 10. PR field matches event PR number
     if int(pr_field) != pr_number:
@@ -243,8 +243,8 @@ def main():
     )
     log_accept(plan_id, round_n, actual_sha, status, commenter)
 
-    # Write context artifact only when Phase B will run (CHANGES_REQUESTED, round < 3)
-    if status == "CHANGES_REQUESTED" and round_n < 3:
+    # Write context artifact only when Phase B will run (CHANGES_REQUESTED, round < 30)
+    if status == "CHANGES_REQUESTED" and round_n < 30:
         findings = parse_feedback_field(body, "Findings")
         recommendations = parse_feedback_field(body, "Recommendations")
         write_context_artifact(plan_id, round_n, actual_sha, status, findings, recommendations)

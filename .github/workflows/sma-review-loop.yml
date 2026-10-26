@@ -1,7 +1,7 @@
 # SMA Review Loop — Phase A (detection) + Phase B (Claude revision proposal)
 #
 # Phase A: validates SMA_REVIEW_COMPLETED protocol fields; logs ACCEPT/REJECT.
-# Phase B: on ACCEPT + CHANGES_REQUESTED + round < 3, checks out the plan at
+# Phase B: on ACCEPT + CHANGES_REQUESTED + round < 30, checks out the plan at
 #          the verified SHA and runs Claude (read-only) to propose a revision.
 #
 # Security constraints:
@@ -59,7 +59,7 @@ jobs:
         if: |
           steps.validate.outputs.accepted == 'true' &&
           steps.validate.outputs.status == 'CHANGES_REQUESTED' &&
-          steps.validate.outputs.round != '3'
+          fromJSON(steps.validate.outputs.round) < 30
         uses: actions/upload-artifact@v4
         with:
           name: sma-review-context-pr${{ github.event.issue.number }}-r${{ steps.validate.outputs.round }}
@@ -74,7 +74,7 @@ jobs:
     if: |
       needs.detect-review-completion.outputs.accepted == 'true' &&
       needs.detect-review-completion.outputs.status == 'CHANGES_REQUESTED' &&
-      needs.detect-review-completion.outputs.round != '3'
+      fromJSON(needs.detect-review-completion.outputs.round) < 30
     runs-on: ubuntu-latest
 
     # Inherit top-level read-only permissions (contents/pull-requests/issues: read).
@@ -223,7 +223,7 @@ jobs:
     if: |
       needs.detect-review-completion.outputs.accepted == 'true' &&
       needs.detect-review-completion.outputs.status == 'CHANGES_REQUESTED' &&
-      needs.detect-review-completion.outputs.round != '3'
+      fromJSON(needs.detect-review-completion.outputs.round) < 30
     runs-on: ubuntu-latest
 
     permissions:
